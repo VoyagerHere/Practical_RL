@@ -183,3 +183,130 @@ def to_one_hot(y, n_dims=None):
     ).scatter_(1, y_tensor, 1)
     y_one_hot = y_one_hot.view(*y.shape, -1)
     return y_one_hot
+
+
+class AttentionTranslationModel(nn.Module):
+    def __init__(self, inp_voc, out_voc, emb_size, hid_size):
+        super().__init__()
+        self.inp_voc = inp_voc
+        self.out_voc = out_voc
+
+        self.emb_inp = nn.Embedding(len(inp_voc), emb_size)
+        self.emb_out = nn.Embedding(len(out_voc), emb_size)
+        
+        # Bidirectional GRU for Encoder
+        self.enc0 = nn.GRU(emb_size, hid_size, batch_first=True, bidirectional=True)
+        
+        # Initial decoder state projected from last encoder states
+        self.dec_start = nn.Linear(hid_size * 2, hid_size)
+        
+        # Decoder GRUCell
+        self.dec0 = nn.GRUCell(emb_size, hid_size)
+        
+        # Projection for keys in attention
+        self.enc_proj = nn.Linear(hid_size * 2, hid_size)
+        
+        # Linear layer to combine GRUCell output and attention context
+        self.combine = nn.Linear(hid_size + hid_size * 2, hid_size)
+        
+        # Output projection
+        self.logits = nn.Linear(hid_size, len(out_voc))
+
+    def encode(self, inp, **flags):
+        device = next(self.parameters()).device
+        inp_emb = self.emb_inp(inp)
+        enc_seq, _ = self.enc0(inp_emb) # [batch, time, hid_size * 2]
+
+        # Select last element w.r.t. mask for initial state
+        end_index = infer_length(inp, self.inp_voc.eos_ix, include_eos=False)
+        end_index[end_index >= inp.shape[1]] = inp.shape[1] - 1
+        enc_last = enc_seq[range(0, enc_seq.shape[0]), end_index.detach(), :] # [batch, hid_size * 2]
+
+        dec_start = self.dec_start(enc_last) # [batch, hid_size]
+        
+        # Create input mask for attention
+        inp_mask = infer_mask(inp, self.inp_voc.eos_ix, include_eos=True).to(dtype=torch.bool, device=device) # [batch, time]
+        
+        return [dec_start, enc_seq, inp_mask]
+
+    def decode(self, prev_state, prev_tokens, **flags):
+        prev_dec, enc_seq, inp_mask = prev_state
+
+        # 1. Update decoder state
+        prev_emb = self.emb_out(prev_tokens) # [batch, emb_size]
+        new_dec_state = self.dec0(prev_emb, prev_dec) # [batch, hid_size]
+
+        # 2. Compute attention weights
+        enc_seq_proj = self.enc_proj(enc_seq) # [batch, time, hid_size]
+        # Dot product scores
+        scores = torch.bmm(enc_seq_proj, new_dec_state.unsqueeze(2)).squeeze(2) # [batch, time]
+        
+        # Mask out padding positions
+        scores.masked_fill_(~inp_mask, -1e9)
+        
+        # Softmax to get weights
+        attn_weights = F.softmax(scores, dim=-1) # [batch, time]
+
+        # 3. Compute context vector
+        context = torch.bmm(attn_weights.unsqueeze(1), enc_seq).squeeze(1) # [batch, hid_size * 2]
+
+        # 4. Combine new decoder state and context
+        combined = torch.tanh(self.combine(torch.cat([new_dec_state, context], dim=-1))) # [batch, hid_size]
+
+        # 5. Output logits
+        output_logits = self.logits(combined) # [batch, len(out_voc)]
+
+        return [new_dec_state, enc_seq, inp_mask], output_logits
+
+    def forward(self, inp, out, eps=1e-30, **flags):
+        device = next(self.parameters()).device
+        batch_size = inp.shape[0]
+        bos = torch.tensor(
+            [self.out_voc.bos_ix] * batch_size,
+            dtype=torch.long,
+            device=device,
+        )
+        logits_seq = [torch.log(to_one_hot(bos, len(self.out_voc)) + eps)]
+
+        hid_state = self.encode(inp, **flags)
+        for x_t in out.transpose(0, 1)[:-1]:
+            hid_state, logits = self.decode(hid_state, x_t, **flags)
+            logits_seq.append(logits)
+
+        return F.log_softmax(torch.stack(logits_seq, dim=1), dim=-1)
+
+    def translate(self, inp, greedy=False, max_len=None, eps=1e-30, **flags):
+        device = next(self.parameters()).device
+        batch_size = inp.shape[0]
+        bos = torch.tensor(
+            [self.out_voc.bos_ix] * batch_size,
+            dtype=torch.long,
+            device=device,
+        )
+        mask = torch.ones(batch_size, dtype=torch.uint8, device=device)
+        logits_seq = [torch.log(to_one_hot(bos, len(self.out_voc)) + eps)]
+        out_seq = [bos]
+
+        hid_state = self.encode(inp, **flags)
+        while True:
+            hid_state, logits = self.decode(hid_state, out_seq[-1], **flags)
+            if greedy:
+                _, y_t = torch.max(logits, dim=-1)
+            else:
+                probs = F.softmax(logits, dim=-1)
+                y_t = torch.multinomial(probs, 1)[:, 0]
+
+            logits_seq.append(logits)
+            out_seq.append(y_t)
+            mask &= y_t != self.out_voc.eos_ix
+
+            if not mask.any():
+                break
+            if max_len and len(out_seq) >= max_len:
+                break
+
+        return (
+            torch.stack(out_seq, 1),
+            F.log_softmax(torch.stack(logits_seq, 1), dim=-1),
+        )
+
